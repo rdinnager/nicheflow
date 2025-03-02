@@ -32,9 +32,13 @@ sample_bias_pnts <- function(spec_polys, reptile_bias_pnts, n = 10000, min_n = 2
     xrange <- xrange + c(-xexpand, xexpand)
     yrange <- yrange + c(-yexpand, yexpand)
     
-    dens <- MASS::kde2d(coords[ , 1], coords[ , 2], n = 100,
+    dens <- possibly(MASS::kde2d)(coords[ , 1], coords[ , 2], n = 100,
                         lims = c(xrange, yrange))
-    dens_rast <- rast(dens)
+    if(!is.null(dens)) {
+      dens_rast <- rast(dens)
+    } else {
+      prop_biased <- rep(0, 3)
+    }
   } else {
     prop_biased <- rep(0, 3)
   }
@@ -74,7 +78,8 @@ sample_bias_pnts <- function(spec_polys, reptile_bias_pnts, n = 10000, min_n = 2
     datasets 
   }
   all_datasets <- map(prop_biased, possibly(get_samps)) |>
-    list_flatten() 
+    list_flatten() |>
+    compact()
   all_df <- all_datasets |>
     map(~ .x |>
           st_coordinates()) 
