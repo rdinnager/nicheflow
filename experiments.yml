@@ -1,0 +1,92 @@
+# Example experiment configuration file for progressive VAE-IWAE-SUMO model
+# Use with run_experiments.R script
+
+# Parameters shared across all experiments
+shared_params:
+  # Data parameters
+  train_file: data/processed/nichencoder_train.csv
+  val_file: data/processed/nichencoder_val.csv
+  input_dim: 19
+  n_species: 100
+  
+  # Training parameters
+  batch_size: 128
+  max_epochs: 500
+  early_stopping: true
+  early_stopping_patience: 30
+  
+  # Checkpointing and saving
+  checkpoint_freq: 50
+  save_progress_image_freq: 10
+  
+  # Hardware
+  use_gradient_accumulation: true
+
+# Experiment definitions
+experiments:
+  # Baseline model with standard configuration
+  baseline:
+    spec_embed_dim: 64
+    latent_dim: 16
+    breadth: 512
+    loggamma_init: -3
+    target_batch_size: 64
+    use_plateau_detection: true
+    
+  # Experiment with larger latent space
+  large_latent:
+    spec_embed_dim: 64
+    latent_dim: 32
+    breadth: 512
+    loggamma_init: -3
+    target_batch_size: 64
+    use_plateau_detection: true
+    
+  # Experiment with deeper/wider network
+  wider_network:
+    spec_embed_dim: 64
+    latent_dim: 16
+    breadth: 1024
+    loggamma_init: -3
+    target_batch_size: 48  # Reduced due to larger model
+    use_plateau_detection: true
+    
+  # Experiment with higher observation noise initialization
+  higher_noise:
+    spec_embed_dim: 64
+    latent_dim: 16
+    breadth: 512
+    loggamma_init: -2  # Higher initial noise (less precision)
+    target_batch_size: 64
+    use_plateau_detection: true
+    
+  # Experiment with fixed phases (no plateau detection)
+  fixed_phases:
+    spec_embed_dim: 64
+    latent_dim: 16
+    breadth: 512
+    loggamma_init: -3
+    target_batch_size: 64
+    use_plateau_detection: false
+    min_epochs_per_phase: [50, 50, 50, 50, 50]  # Fixed epochs per phase
+    
+  # Experiment with more aggressive phase transitions
+  aggressive_transitions:
+    spec_embed_dim: 64
+    latent_dim: 16
+    breadth: 512
+    loggamma_init: -3
+    target_batch_size: 64
+    use_plateau_detection: true
+    plateau_patience: 8  # Default is 15
+    plateau_rel_improvement: 0.001  # Default is 0.005
+    
+  # Experiment with higher K values
+  higher_k:
+    spec_embed_dim: 64
+    latent_dim: 16
+    breadth: 512
+    loggamma_init: -3
+    target_batch_size: 32  # Reduced due to higher K
+    use_plateau_detection: true
+    phase_K_values: [1, 20, 50, 50, 50]  # Higher K values (default is [1, 10, 30, 30, 30])
