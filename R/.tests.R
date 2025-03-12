@@ -1,0 +1,6 @@
+library(torch)
+k <- torch_rand(10, 5, 3)
+q <- torch_rand_like(k)
+v <- torch_rand_like(k)
+test <- torch:::torch_scaled_dot_product_attention()
+test2 <- torch:::torch__scaled_dot_product_attention(q, k, v)

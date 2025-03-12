@@ -85,6 +85,44 @@ tar_plan(
   tar_target(bias_samples, sample_bias_pnts(spec_polys, reptile_bias_pnts),
              pattern = map(spec_polys)),
   
+  tar_target(all_ground_truth_samples, list_rbind(ground_truth_samples),
+             deployment = "main"),
+  
+  tar_target(ground_truth_sample_split, make_ground_truth_splits(all_ground_truth_samples,
+                                                                 split_ratio = c(0.8, 0.1)),
+             deployment = "main"),
+  
+  ## use recipes to do all data preprocessing
+  tar_target(nichencoder_input_preprocess_recipe, recipe(head(ground_truth_sample_split$train),
+                                                   vars = colnames(ground_truth_sample_split$train),
+                                                   roles = c(rep("predictor", ncol(ground_truth_sample_split$train) -1), "ID")) |>
+               step_normalize(all_predictors()) |>
+               #step_YeoJohnson(all_predictors()) |>
+               step_indicate_na(all_predictors()) |>
+               prep(ground_truth_sample_split$train),
+             deployment = "main"),
+  
+  tar_target(nichencoder_train, bake(nichencoder_input_preprocess_recipe,
+                                                  new_data = NULL),
+             deployment = "main"),
+  
+  tar_target(nichencoder_val, bake(nichencoder_input_preprocess_recipe,
+                                     new_data = ground_truth_sample_split$val),
+             deployment = "main"),
+  
+  tar_target(nichencoder_test, bake(nichencoder_input_preprocess_recipe,
+                                     new_data = ground_truth_sample_split$test),
+             deployment = "main"),
+  
+  tar_target(nichencoder_train_csv, write_csv(nichencoder_train, "data/nichencoder_train.csv"),
+             deployment = "main"),
+  
+  tar_target(nichencoder_val_csv, write_csv(nichencoder_val, "data/nichencoder_val.csv"),
+             deployment = "main"),
+  
+  tar_target(nichencoder_test_csv, write_csv(nichencoder_test, "data/nichencoder_test.csv"),
+             deployment = "main"),
+  
   tar_target(nichencoder_script, "train_nichencoder.R")
 
 )

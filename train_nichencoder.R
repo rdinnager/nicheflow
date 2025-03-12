@@ -8,33 +8,56 @@ library(dagnn)
 library(tidyverse)
 library(tidymodels)
 library(zeallot)
+library(patchwork)
 library(conflicted)
 
 conflict_prefer("select", "dplyr")
 conflict_prefer("filter", "dplyr")
 
+source("R/models.R")
+
 set.seed(536567678)
 
-train_file <- "data/squamate_training2.csv"
+train_file <- "data/nichencoder_train.csv"
 train <- read_csv(train_file)
 
-species <- as.integer(as.numeric(as.factor(train$Binomial)))
+val_file <- "data/nichencoder_val.csv"
+val <- read_csv(val_file)
 
-squamate_train <- train |>
-  select(-Binomial, -X, -Y, -n) |>
+species_names <- train$species
+species_train <- as.integer(as.numeric(as.factor(species_names)))
+species_inds <- tibble(species = species_names, index = species_train) |>
+  distinct()
+
+## only validate on species that occur in training data for this model
+val <- val |>
+  filter(species %in% species_names)
+
+val_reshape <- val |>
+  left_join(species_inds) |>
+  group_by(species) |>
+  summarise(env = list(as.matrix(pick(c(-X, -Y, -starts_with("na_ind_"), -index)))),
+            na_mask = list(as.matrix(pick(c(starts_with("na_ind_"), -na_ind_X, -na_ind_Y)))),
+            spec = list(as.matrix(pick(c(index)))))
+
+na_mask_val <- map(val_reshape$na_mask, ~ 1 - .x)
+env_val <- map2(val_reshape$env, na_mask_val,
+                ~ {.x[.y == 0] <- 0; .x})
+species_val <- val_reshape$spec
+
+# species_val <- val |>
+#   left_join(species_inds) |>
+#   pull(index)
+
+env_train <- train |>
+  select(-species, -X, -Y, -starts_with("na_ind_")) |>
   as.matrix()
-#squamate_test <- read_csv("output/squamate_testing.csv")
-
-train <- scale(train)
-
-scaling <- list(means = attr(train, "scaled:center"),
-                sd = attr(train, "scaled:scale"))
-
-write_rds(scaling, "output/squamate_env_scaling.rds")
-
-na_mask <- apply(train, 2, function(x) as.numeric(!is.na(x)))
-
-squamate_train[na_mask == 0] <- 0
+na_mask_train <- train |>
+  select(starts_with("na_ind_"), -na_ind_X, -na_ind_Y) |>
+  as.matrix()
+  
+na_mask_train <- 1 - na_mask_train
+env_train[na_mask_train == 0] <- 0
 
 env_dataset <- dataset(name = "env_ds",
                        initialize = function(env, mask, spec) {
@@ -49,129 +72,48 @@ env_dataset <- dataset(name = "env_ds",
                          self$env$size()[[1]]
                        })
 
-batch_size <- 900000
+env_val_dataset <- dataset(name = "env_ds",
+                           initialize = function(env, mask, spec) {
+                             self$env <- map(env, torch_tensor)
+                             self$mask <- map(mask, torch_tensor)
+                             self$spec <- map(spec, ~ torch_tensor(.x[ , 1]))
+                           },
+                           .getbatch = function(i) {
+                             list(env = self$env[i], mask = self$mask[i], spec = self$spec[i])
+                           },
+                           .length = function() {
+                             length(self$env)
+                           })
 
-train_ds <- env_dataset(train, na_mask, species)
+batch_size <- 1000000 / 50
+batch_size_val <- 50
+
+train_ds <- env_dataset(env_train, na_mask_train, species_train)
 train_dl <- dataloader(train_ds, batch_size, shuffle = TRUE)
+n_batch <- length(train_dl)
 
-#test <- train_dl$.iter()$.next()
+val_ds <- env_val_dataset(env_val, na_mask_val, species_val)
+val_dl <- dataloader(val_ds, batch_size_val, shuffle = TRUE)
 
-env_vae_mod <- nn_module("NichEncoder",
-                         initialize = function(input_dim, n_spec, spec_embed_dim, latent_dim, breadth = 1024L, loggamma_init = 0) {
-                           self$latent_dim <- latent_dim
-                           self$input_dim <- input_dim
-                           self$n_spec <- n_spec
-                           self$spec_embed_dim <- spec_embed_dim
-                           self$encoder <- nndag(y = ~ input_dim,
-                                                 s = ~ spec_embed_dim,
-                                                 e_1 = y + s ~ breadth,
-                                                 e_2 = e_1 + s ~ breadth,
-                                                 e_3 = e_2 + s ~ breadth,
-                                                 means = e_3 ~ latent_dim,
-                                                 logvars = e_3 ~ latent_dim,
-                                                 .act = list(nn_relu,
-                                                             logvars = nn_identity,
-                                                             means = nn_identity))
-                           
-                           self$decoder <- nndag(z = ~ latent_dim,
-                                                 s = ~ spec_embed_dim,
-                                                 d_1 = z + s ~ breadth,
-                                                 d_2 = d_1 + s ~ breadth,
-                                                 d_3 = d_2 + s ~ breadth,
-                                                 out = d_3 ~ input_dim,
-                                                 .act = list(nn_relu,
-                                                             out = nn_identity))
-                           
-                           self$species_embedder_mean <- nn_embedding(n_spec, spec_embed_dim#,
-                                                                      # .weight = torch_randn(n_spec,
-                                                                      #                       spec_embed_dim) * 0.01
-                                                                      )
-                           # self$species_embedder_var <- nn_embedding(n_spec, spec_embed_dim,
-                           #                                           .weight = -3 + torch_randn(n_spec,
-                           #                                                                 spec_embed_dim) * 0.01
-                           #                                           )
-                           
-                           self$loggamma <- nn_parameter(torch_tensor(loggamma_init))
-                           
-                         },
-                         reparameterize = function(mean, logvar) {
-                           std <- torch_exp(torch_tensor(0.5, device = "cuda") * logvar)
-                           eps <- torch_randn_like(std)
-                           eps * std + mean
-                         },
-                         loss_function = function(reconstruction, input, mask, mean, log_var, mean_spec, #log_var_spec, 
-                                                  #loggamma,
-                                                  lambda = 1,
-                                                  alpha = 0) {
-                           
-                           kl <- torch_sum(torch_exp(log_var) + torch_square(mean) - log_var, dim = 2L) - self$latent_dim
-                           kl_spec <- ((1 - alpha) * torch_sum(torch_square(mean_spec), dim = 2L) + alpha * torch_sum(torch_abs(mean_spec), dim = 2L)) * lambda
-                           recon1 <- torch_sum(torch_square(input - reconstruction) * mask, dim = 2L) / torch_exp(self$loggamma)
-                           recon2 <- self$input_dim * self$loggamma + torch_log(torch_tensor(2 * pi, device = "cuda")) * self$input_dim
-                           #recon_loss <- (torch_sum(recon1) / torch_sum(mask)) + torch_mean(recon2)
-                           loss <- torch_mean(kl + kl_spec + recon1 + recon2)
-                           list(loss, torch_mean(recon1*torch_exp(self$loggamma)) / self$input_dim, torch_mean(kl), torch_mean(kl_spec))
-                         },
-                         encode = function(x, s = NULL) {
-                           if(is.null(s)) {
-                             spec_embedding <- torch_zeros(x$size()[[1]], self$spec_embed_dim, device = x$device)
-                           } else {
-                             if(s$size[[1]] == 1 | s$size[[1]] == self$n_spec) {
-                               s <- s$`repeat`(s(x$size()[[1]], 1))
-                             }
-                             spec_embedding <- self$species_embedder_mean(s)
-                           }
-                           self$encoder(x, spec_embedding)
-                         },
-                         decode = function(z, s = NULL) {
-                           if(is.null(s)) {
-                             spec_embedding <- torch_zeros(x$size()[[1]], self$spec_embed_dim, device = x$device)
-                           } else {
-                             if(s$size[[1]] == 1 | s$size[[1]] == self$n_spec) {
-                               s <- s$`repeat`(c(x$size()[[1]], 1))
-                             }
-                             spec_embedding <- self$species_embedder_mean(s)
-                           }
-                           self$decoder(z, spec_embedding)
-                         },
-                         sample = function(n, s = NULL) {
-                           z <- self$reparameterize(torch_zeros(n, self$latent_dim),
-                                                    torch_zeros(n, self$latent_dim))
-                           if(s$size[[1]] == 1 | s$size[[1]] == self$latent_dim) {
-                             s <- s$`repeat`(c(n, 1))
-                           }
-                           self$decode(z, s)
-                         },
-                         forward = function(x, s = NULL) {
-                           if(is.null(s)) {
-                             spec_embedding_mean <- torch_zeros(x$size()[[1]], self$spec_embed_dim, device = x$device)
-                             #spec_embedding_log_var <- torch_zeros(x$size()[[1]], self$spec_embed_dim, device = x$device) + 0.001
-                           } else {
-                             spec_embedding_mean <- self$species_embedder_mean(s)
-                             #spec_embedding_log_var <- self$species_embedder_var(s)
-                           }
-                           #z_spec <- self$reparameterize(spec_embedding_mean, spec_embedding_log_var)
-                           c(means, log_vars) %<-% self$encoder(y = x, s = spec_embedding_mean)
-                           z <- self$reparameterize(means, log_vars)
-                           list(self$decoder(z = z, s = spec_embedding_mean), x, spec_embedding_mean, means, log_vars)
-                         }
-                         
-)
-
-input_dim <- ncol(train)
-n_spec <- n_distinct(species)
-spec_embed_dim <- 32L
+input_dim <- ncol(env_train)
+n_spec <- n_distinct(species_train)
+spec_embed_dim <- 256L
 latent_dim <- 16L
 breadth <- 1024L
-alpha <- 0.5
+alpha <- 0
+K <- 50
+lambda <- 1
 
-env_vae <- env_vae_mod(input_dim, n_spec, spec_embed_dim, latent_dim, breadth, loggamma_init = -3)
-env_vae <- env_vae$cuda()
+nchencdr <- nichencoder(input_dim, n_spec, spec_embed_dim, latent_dim, breadth, loggamma_init = -3)
+nchencdr$cuda()
 
-num_epochs <- 2500
+# env_vae <- env_vae_mod(input_dim, n_spec, spec_embed_dim, latent_dim, breadth, loggamma_init = -3)
+# env_vae <- env_vae$cuda()
+
+num_epochs <- 1000
 
 lr <- 0.002
-optimizer <- optim_adamw(env_vae$parameters, lr = lr)
+optimizer <- optim_adamw(nchencdr$parameters, lr = lr)
 scheduler <- lr_one_cycle(optimizer, max_lr = lr,
                           epochs = num_epochs, steps_per_epoch = length(train_dl),
                           cycle_momentum = FALSE)
@@ -180,9 +122,10 @@ epoch_times <- numeric(num_epochs * length(train_dl))
 i <- 0
 #b <- train_dl$.iter()$.next()
 
-zz <- file("output/logs/squamate_env_model_fixed2_run_1.txt", open = "wt")
-sink(zz, type = "output", split = TRUE)
-sink(zz, type = "message")
+# zz <- file("output/logs/squamate_env_model_fixed2_run_1.txt", open = "wt")
+# sink(zz, type = "output", split = TRUE)
+# sink(zz, type = "message")
+mse <- torch_tensor(-99)
 
 for (epoch in 1:num_epochs) {
   
@@ -194,38 +137,115 @@ for (epoch in 1:num_epochs) {
     i <- i + 1
     optimizer$zero_grad()
     
-    c(reconstruction, input, mean_spec, means, log_vars) %<-% env_vae(b$env$cuda(), b$spec$cuda())
-    c(loss, reconstruction_loss, kl_loss, kl_loss_spec) %<-% env_vae$loss_function(reconstruction, input, 
-                                                                                   b$mask$cuda(), means, 
-                                                                                   log_vars, mean_spec, 
-                                                                                   alpha = alpha)
+    c(x, z, s, means, log_vars, iwae_loss, spec_loss) %<-% nchencdr(b$env$cuda(),
+                                                                    b$spec$cuda(),
+                                                                    na_mask = b$mask$cuda(),
+                                                                    K = K)
     
-      cat("Epoch: ", epoch,
-          "  batch: ", batchnum,
-          "  loss: ", as.numeric(loss$cpu()),
-          "  recon loss: ", as.numeric(reconstruction_loss$cpu()),
-          "  KL loss: ", as.numeric(kl_loss$cpu()),
-          "  species KL loss: ", as.numeric(kl_loss_spec$cpu()),
-          "  loggamma: ", as.numeric(env_vae$loggamma$cpu()),
-          #"    loggamma: ", loggamma,
-          "  cond. active dims: ", as.numeric((torch_exp(log_vars)$mean(dim = 1L) < 0.5)$sum()$cpu()),
-          "  spec. cond. active dims: ", as.numeric(((torch_square(mean_spec)$mean(dim = 1L) / torch_square(mean_spec)$mean(dim = 1L)$sum()) > 0.01)$sum()$cpu()),
-          "\n")
+    
+    loss <- iwae_loss + spec_loss
+   
+    
+      cat("Step:", i,
+          "\nEpoch:", epoch,
+          "\nbatch:", batchnum, "of ", n_batch,
+          "\nloss:", as.numeric(loss$cpu()),
+          "\nIWAE loss:", as.numeric(iwae_loss$cpu()),
+          "\nSpecies loss:", as.numeric(spec_loss$cpu()),
+          "\nValidation MSE:", as.numeric(mse$cpu()),
+          "\nloggamma:", as.numeric(nchencdr$vae$loggamma$cpu()),
+          "\ncond. active dims:", as.numeric((torch_exp(log_vars)$mean(dim = 1L) < 0.5)$sum()$cpu()),
+          "\nSpecies latent variance:", as.numeric(torch_var(s, dim = 1)$mean()$cpu()),
+          "\n\n")
       
     loss$backward()
     optimizer$step()
     scheduler$step()
   })
   
+  ## do validation here
+  gc()
+  cuda_empty_cache()
+  
+  v <- coro::collect(val_dl, 1)[[1]]
+  if(coro::is_exhausted(v)) {
+    val_dl <- dataloader(val_ds, batch_size, shuffle = TRUE)
+    v <- coro::collect(val_dl, 1)[[1]]
+  }
+  
+  with_no_grad({
+    x <- torch_cat(v$env)$cuda()
+    recon <- nchencdr$reconstruct_from_species_index(x, 
+                                                     torch_cat(v$spec)$cuda(),
+                                                     K = 1)
+    
+    mse <- torch_mean(torch_square(x - recon))
+  })
+  
+  prob_species <- function(env_spec, spec) {
+    with_no_grad({
+      dim_choose <- sample.int(30, 2)
+      env_dat <- as.matrix(env_spec)[ , dim_choose]
+      range_1 <- range(env_dat[ , 1])
+      range_2 <- range(env_dat[ , 2])
+      range_1 <- range_1 + c(-0.3*diff(range_1), 0.3*diff(range_1))
+      range_2 <- range_2 + c(-0.3*diff(range_2), 0.3*diff(range_2))
+      test_grid <- expand_grid(var_1 = seq(range_1[1], range_1[2], length.out = 100),
+                               var_2 = seq(range_2[1], range_2[2], length.out = 100)) |>
+        as.matrix() |>
+        torch_tensor(device = "cuda")
+      x_means <- torch_mean(torch_tensor(env_spec, device = "cuda"), dim = 1, keepdim = TRUE)$expand(c(nrow(test_grid), -1))$clone()
+      x_means[ , dim_choose] <- test_grid
+      
+      spec_expanded <- spec[1]$expand(c(x_means$shape[1]))
+      iwae_losses <- nchencdr$iwae_loss_from_species_index(x_means,
+                                                           spec_expanded$cuda(),
+                                                           torch_ones_like(x_means),
+                                                           K = 100)
+      
+      plot_df <- as.matrix(test_grid$cpu()) |>
+        as.data.frame() |>
+        mutate(prob = as.numeric(iwae_losses$cpu()))
+    })
+    
+    p <- ggplot(plot_df, aes(V1, V2)) +
+      geom_raster(aes(fill = prob)) +
+      geom_point(data = as.data.frame(env_dat) |> setNames(c("V1", "V2")),
+                 alpha = 0.25) +
+      scale_fill_viridis_c() +
+      theme_minimal()
+    gc()
+    cuda_empty_cache()
+    p
+  }
+  
+  spec_plots <- map2(v$env[1:9], v$spec[1:9],
+                     prob_species, .progress = TRUE)
+  
+  ps <- wrap_plots(spec_plots, ncol = 3, nrow = 3)
+  ggsave("prob_progress_temp.png", ps, width = 16, height = 16)
+  plot(ps)
+  
   time <- Sys.time() - epoch_time
   epoch_times[i] <- time
   cat("Estimated time remaining: ")
   print(lubridate::as.duration(mean(epoch_times[epoch_times > 0]) * (num_epochs - epoch)))
+  cat("\n")
   
 }
 
-options(torch.serialization_version = 2)
-torch_save(env_vae, "data/env_vae_trained_fixed2_alpha_0.5_32d.to")
+#options(torch.serialization_version = 2)
+torch_save(env_vae, "output/testing/env_vae_trained_test_256d_iwae.to")
 
-sink()
+#sink()
 
+##### testing validation
+env_vae <- torch_load("output/testing/env_vae_trained_test_256d_iwae.to")
+#env_vae$load_state_dict(env_vae2$state_dict())
+env_vae <- env_vae$cuda()
+
+
+
+
+
+x_recon <- env_vae$decode(z, spec_lat)

@@ -5,6 +5,9 @@ library(abind)
 
 source("R/utils.R")
 
+## change this to checkpoint <- NULL to train from scratch
+checkpoint <- "output/nichePFN/checkpoint.to"
+
 bias_data_train <- read_rds("output/bias_data_for_nichePFN_train.rds") |>
   drop_na()
 
@@ -59,7 +62,7 @@ bias_dataset <- dataset(name = "bias_ds",
                          self$lats$size()[[1]]
                        })
 
-batch_size <- 1200
+batch_size <- 1000
 
 train_ds <- bias_dataset(spec_nums_train, bias_data_train, dataset_tensor)
 train_dl <- dataloader(train_ds, batch_size, shuffle = TRUE, pin_memory = TRUE)
@@ -102,7 +105,7 @@ transformer_block <- nn_module("TransformerBlock",
                                })
 
 nichePFN <- nn_module("NichePFN",
-                      initialize = function(input_dim = 2L, embed_dim = 384L, output_dim = 32L, n_blocks = 16L, num_heads = 8L, dropout_prob = 0.1) {
+                      initialize = function(input_dim = 2L, embed_dim = 144L, output_dim = 32L, n_blocks = 4L, num_heads = 3L, dropout_prob = 0.1) {
                         self$input_dim <- input_dim
                         self$embed_dim <- embed_dim
                         self$embedding <- nn_linear(input_dim, embed_dim)
@@ -116,7 +119,7 @@ nichePFN <- nn_module("NichePFN",
                       },
                       forward = function(input, mask) {
                         x <- self$embed_dropout(self$embedding(input))
-                        for(i in length(self$blocks)) {
+                        for(i in 1:length(self$blocks)) {
                           x <- self$blocks[[i]](x, mask)
                         }
                         x <- torch_sum(x, dim = 2L)
@@ -124,7 +127,13 @@ nichePFN <- nn_module("NichePFN",
                         out
                       })
 
-npfn <- nichePFN()
+
+if(!is.null(checkpoint)) {
+  npfn <- torch_load(checkpoint)
+} else {
+  npfn <- nichePFN()  
+}
+
 npfn <- npfn$cuda()
 
 ## trick to make sure enough CUDA memory gets preallocated
@@ -140,7 +149,7 @@ npfn <- npfn$cuda()
 rm(test1, test2, out1, out2, l)
 gc()
 
-num_epochs <- 300
+num_epochs <- 100
 
 lr <- 0.0002
 optimizer <- optim_adamw(npfn$parameters, lr = lr)
