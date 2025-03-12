@@ -1,0 +1,128 @@
+- model: progressive-vae
+  description: Progressive VAE-IWAE-SUMO model for species niche modeling
+  operations:
+    train:
+      description: Train a progressive VAE-IWAE-SUMO model
+      main: train
+      flags:
+        # Data parameters
+        train_file:
+          description: Path to training data CSV
+          default: data/processed/nichencoder_train.csv
+        val_file:
+          description: Path to validation data CSV
+          default: data/processed/nichencoder_val.csv
+        input_dim:
+          description: Dimension of input features
+          default: 19
+        n_species:
+          description: Number of species categories
+          default: 100
+          
+        # Model architecture
+        spec_embed_dim:
+          description: Dimension of species embeddings
+          default: 64
+        latent_dim:
+          description: Dimension of latent space
+          default: 16
+        breadth:
+          description: Width of hidden layers
+          default: 512
+        loggamma_init:
+          description: Initial log observation noise
+          default: -3
+        
+        # Training parameters
+        batch_size:
+          description: Batch size for training
+          default: 128
+        target_batch_size:
+          description: Target batch size for gradient accumulation
+          default: 64
+        max_epochs:
+          description: Maximum number of training epochs
+          default: 500
+          
+        # Phase configuration
+        phase_config:
+          description: Path to phase configuration YAML file
+          default: config/phases.yaml
+        
+        # Progressive training parameters
+        use_plateau_detection:
+          description: Use plateau detection for phase transitions
+          default: yes
+        early_stopping:
+          description: Use early stopping
+          default: yes
+        
+        # Checkpointing and saving
+        save_dir:
+          description: Directory to save models
+          default: results/models
+        checkpoint_freq:
+          description: Frequency of checkpoint saving
+          default: 25
+        val_freq:
+          description: Frequency of validation (every n epochs)
+          default: 5
+        results_name:
+          description: Name prefix for saved results
+        
+        # Hardware
+        train_device:
+          description: Device to use for training
+          default: cuda:0
+        val_device:
+          description: Device to use for validation
+          default: cuda:1
+        use_async_validation:
+          description: Use asynchronous validation on separate GPU
+          default: yes
+        use_gradient_accumulation:
+          description: Use gradient accumulation
+          default: yes
+          
+    evaluate:
+      description: Evaluate a trained model
+      main: evaluate
+      flags:
+        model_path:
+          description: Path to the trained model file (.pt)
+          required: yes
+        config_path:
+          description: Path to the model configuration file (.rds)
+          required: yes
+        test_file:
+          description: Path to test data CSV
+          required: yes
+        output_dir:
+          description: Directory to save evaluation results
+          default: evaluation_results
+        K:
+          description: Number of importance samples for evaluation
+          default: 100
+        device:
+          description: Device to use (cuda or cpu)
+          default: cuda
+          
+    experiments:
+      description: Run multiple experiments with different configurations
+      main: run_experiments
+      flags:
+        config_yaml:
+          description: Path to YAML configuration file defining experiments
+          default: experiments.yaml
+        results_base_dir:
+          description: Base directory for experiment results
+          default: results/experiments
+        train_device:
+          description: Device to use for training
+          default: cuda:0
+        val_device:
+          description: Device to use for validation
+          default: cuda:1
+        use_async_validation:
+          description: Use asynchronous validation
+          default: yes

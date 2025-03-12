@@ -1,0 +1,51 @@
+# Example phase configuration for progressive VAE-IWAE-SUMO training
+# This file defines the sequence of phases used in training
+
+phases:
+  # Phase 1: Standard VAE with analytical KL
+  - mode: vae
+    name: VAE
+    K: 1
+    truncation: 0
+    base_lr: 0.001
+    min_epochs: 20
+  
+  # Phase 2: IWAE with low K
+  - mode: iwae
+    name: IWAE-10
+    K: 10
+    truncation: 0
+    base_lr: 0.0007
+    min_epochs: 20
+  
+  # Phase 3: IWAE with medium K
+  - mode: iwae
+    name: IWAE-30
+    K: 30
+    truncation: 0
+    base_lr: 0.0005
+    min_epochs: 20
+  
+  # Phase 4: IWAE with high K
+  - mode: iwae
+    name: IWAE-50
+    K: 50
+    truncation: 0
+    base_lr: 0.0004
+    min_epochs: 25
+  
+  # Phase 5: SUMO with low truncation
+  - mode: sumo
+    name: SUMO-2
+    K: 50
+    truncation: 2
+    base_lr: 0.0003
+    min_epochs: 25
+  
+  # Phase 6: SUMO with higher truncation
+  - mode: sumo
+    name: SUMO-4
+    K: 50
+    truncation: 4
+    base_lr: 0.0002
+    min_epochs: 30
