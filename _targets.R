@@ -1011,17 +1011,23 @@ tar_plan(
 
       set.seed(42)
       target_n <- eval_n_total_species
-      n_strata <- n_distinct(meta$stratum)
+      n_strata <- length(unique(meta$stratum))
       per_stratum <- ceiling(target_n / n_strata)
 
       # Fewer large-range species (slower to evaluate)
-      sampled <- meta |>
+      meta <- meta |>
         mutate(max_n = ifelse(size_band == "large",
                               ceiling(per_stratum * 0.5),
-                              per_stratum)) |>
+                              per_stratum))
+
+      # Sample per stratum, capping at max_n
+      sampled <- meta |>
         group_by(stratum) |>
-        slice_sample(n = min(n(), first(max_n))) |>
-        ungroup()
+        mutate(.rand = runif(n())) |>
+        arrange(.rand, .by_group = TRUE) |>
+        filter(row_number() <= max_n[1]) |>
+        ungroup() |>
+        select(-.rand)
 
       # Trim to target
       if (nrow(sampled) > target_n) {
