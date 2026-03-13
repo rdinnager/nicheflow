@@ -39,9 +39,8 @@ nvidia-smi
 echo "==========================="
 
 # Run all evaluation + disdat targets
-# shortcut=TRUE prevents re-running upstream targets (e.g. nichencoder_training)
-# that are only "outdated" due to prior depend-hash drift, not actual changes.
-# The upstream data (VAE, NichEncoder, JADE parquets) is confirmed correct.
+# nichencoder_training is protected with cue="never" so it won't re-run
+# even though it shows as outdated from depend-hash drift.
 Rscript -e '
   targets::tar_make(
     names = c(
@@ -49,8 +48,7 @@ Rscript -e '
       eval_auc_parquet,
       eval_emd_parquet,
       disdat_parquets
-    ),
-    shortcut = TRUE
+    )
   )
 '
 

@@ -77,9 +77,11 @@ tar_plan(
     deployment = "main"
   ),
 
+  # cue("never"): completed, outdated from depend-hash drift
   tar_target(chelsa_bioclim_rast_files,
     list.files("data/SDM/env/CHELSA-BIOMCLIM+/1981-2010/bio", full.names = TRUE) |>
       str_subset(bioclim_include_pattern),
+    cue = tar_cue("never"),
     deployment = "main"),
 
   # ===========================================================================
@@ -422,10 +424,11 @@ tar_plan(
     deployment = "main"
   ),
 
-  # Summary statistics for verification
+  # cue("never"): completed, outdated from depend-hash drift
   tar_target(
     jade_split_summary_31,
     summarize_jade_splits(jade_train_val_test_31, jade_split_assignments_31),
+    cue = tar_cue("never"),
     deployment = "main"
   ),
 
@@ -624,6 +627,7 @@ tar_plan(
   # Determine active latent dimensions from the original VAE training data.
   # Encodes a random 1M-row subset of the global env tensor, computes
   # mean(exp(logvar)) per dim; active = those < 0.5
+  # cue("never"): completed, outdated only from depend-hash drift
   tar_target(
     vae_active_dims,
     detect_active_dims(
@@ -632,13 +636,14 @@ tar_plan(
       device = "cuda:0", batch_size = 500000L,
       n_samples = 1000000L, threshold = 0.5
     ),
+    cue = tar_cue("never"),
     resources = tar_resources(
       crew = tar_resources_crew(controller = "gpu0")
     ),
     deployment = "worker"
   ),
 
-  # Encode JADE train split through VAE -> latent codes (active dims only)
+  # cue("never"): completed, outdated only from cascade
   tar_target(
     jade_encoded_train,
     encode_jade_through_vae(
@@ -647,13 +652,14 @@ tar_plan(
       latent_dim = nichencoder_env_latent_dim,
       device = "cuda:0", batch_size = 500000L
     ),
+    cue = tar_cue("never"),
     resources = tar_resources(
       crew = tar_resources_crew(controller = "gpu0")
     ),
     deployment = "worker"
   ),
 
-  # Encode val split
+  # cue("never"): completed, outdated only from cascade
   tar_target(
     jade_encoded_val,
     encode_jade_through_vae(
@@ -662,6 +668,7 @@ tar_plan(
       latent_dim = nichencoder_env_latent_dim,
       device = "cuda:0", batch_size = 500000L
     ),
+    cue = tar_cue("never"),
     resources = tar_resources(
       crew = tar_resources_crew(controller = "gpu0")
     ),
@@ -690,7 +697,7 @@ tar_plan(
     deployment = "main"
   ),
 
-  # Export encoded data as parquet files for training script
+  # cue("never"): completed, outdated only from cascade
   tar_target(
     jade_encoded_train_parquet,
     {
@@ -698,10 +705,12 @@ tar_plan(
       arrow::write_parquet(jade_encoded_train, path)
       path
     },
+    cue = tar_cue("never"),
     format = "file",
     deployment = "main"
   ),
 
+  # cue("never"): completed, outdated only from cascade
   tar_target(
     jade_encoded_val_parquet,
     {
@@ -709,6 +718,7 @@ tar_plan(
       arrow::write_parquet(jade_encoded_val, path)
       path
     },
+    cue = tar_cue("never"),
     format = "file",
     deployment = "main"
   ),
@@ -854,7 +864,7 @@ tar_plan(
     iteration = "list"
   ),
 
-  # Extract trained NichEncoder species embeddings
+  # cue("never"): completed, outdated from depend-hash drift
   tar_target(
     nichencoder_species_embeddings,
     extract_nichencoder_embeddings(
@@ -864,10 +874,11 @@ tar_plan(
       spec_embed_dim = 64L,
       breadths = c(512L, 256L, 128L)
     ),
+    cue = tar_cue("never"),
     deployment = "main"
   ),
 
-  # Assemble geo-encoder dataset: normalize, species-level split, export parquet
+  # cue("never"): completed, outdated from cascade
   tar_target(
     geoencoder_dataset,
     build_geoencoder_dataset(
@@ -875,6 +886,7 @@ tar_plan(
       nichencoder_species_embeddings,
       xy_mean_sd
     ),
+    cue = tar_cue("never"),
     deployment = "main"
   ),
 
