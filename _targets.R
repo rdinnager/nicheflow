@@ -732,6 +732,8 @@ tar_plan(
 
   # NichEncoder rectified flow training (cuda:0)
   # Two-cycle LR: 1500 epochs at lr=0.001, then optimizer reset + 1500 at lr=0.0001
+  # cue = tar_cue("never") prevents re-running: training is complete (epoch 3000)
+  # and the "outdated" status is a false positive from depend-hash drift
   tar_target(
     nichencoder_training,
     run_script("train_nichencoder.R", params = list(
@@ -755,6 +757,7 @@ tar_plan(
       clear_checkpoints = TRUE,
       checkpoint_dir = "output/checkpoints/nichencoder"
     )),
+    cue = tar_cue("never"),
     resources = tar_resources(
       crew = tar_resources_crew(controller = "gpu0")
     ),
