@@ -52,3 +52,9 @@ _targets/
 data/
 logs/
 output/
+
+.claude/
+claude_notes_and_utils/
+core.R-*
+Rplots.pdf
+prob_progress_temp.png

@@ -1,251 +1,393 @@
-#| requires:
-#|     - file: data
-#|       target-type: link
-#|     - file: output
+# train_nichencoder.R
+# NichEncoder Rectified Flow training script
+#
+# Learns species-specific environmental distributions in VAE latent space
+# via a conditional rectified flow (U-Net trajectory network with species
+# embeddings). GPU-native Euler ODE integration.
+#
+# Usage:
+#   Rscript run.R train_nichencoder.R device=cuda:0 num_epochs=3000
+#   Rscript run.R train_nichencoder.R num_epochs=3 batch_size=10000  # smoke test
 
 library(torch)
 library(dagnn)
-library(tidyverse)
-library(tidymodels)
 library(zeallot)
-library(patchwork)
-library(conflicted)
+options(torch.serialization_version = 3)
 
-conflict_prefer("select", "dplyr")
-conflict_prefer("filter", "dplyr")
+source("R/functions_vae_validation.R")   # for checkpoint functions
+source("R/functions_nichencoder.R")
 
-source("R/models.R")
+# ===========================================================================
+# Parameters
+# ===========================================================================
 
-set.seed(536567678)
+#| param
+encoded_train_parquet <- "data/processed/jade_encoded_train.parquet"
+#| param
+encoded_val_parquet <- "data/processed/jade_encoded_val.parquet"
+#| param
+species_map_file <- "output/nichencoder_config/species_map.rds"
+#| param
+device <- "cuda:0"
+#| param
+spec_embed_dim <- 64L
+#| param
+breadths <- c(512L, 256L, 128L)
+#| param
+batch_size <- 500000L
+#| param
+num_epochs <- 3000L
+#| param
+lr <- 0.001
+#| param
+latent_noise_scale <- 0.01
+#| param
+time_sampling <- "logit_normal"
+#| param
+time_logit_normal_mean <- 0
+#| param
+time_logit_normal_sd <- 1
+#| param
+checkpoint_dir <- "output/checkpoints/nichencoder"
+#| param
+checkpoint_every <- 50L
+#| param
+val_every <- 50L
+#| param
+loss_type <- "pseudo_huber"
+#| param
+ode_steps <- 500L
+#| param
+n_cycles <- 2L
+#| param
+cycle_2_lr_factor <- 0.1
+#| param
+cycle_1_fraction <- 0.5
+#| param
+clear_checkpoints <- FALSE
+#| param
+n_fixed_val_species <- 5L
+#| param
+n_random_val_species <- 5L
+#| param
+n_metric_species <- 100L
 
-train_file <- "data/nichencoder_train.csv"
-train <- read_csv(train_file)
+# ===========================================================================
+# Data keys (captured by run_script)
+# ===========================================================================
 
-val_file <- "data/nichencoder_val.csv"
-val <- read_csv(val_file)
+#| data train_epoch train_loss
+#| data val_epoch val_loss val_swd val_centroid_mse
 
-species_names <- train$species
-species_train <- as.integer(as.numeric(as.factor(species_names)))
-species_inds <- tibble(species = species_names, index = species_train) |>
-  distinct()
+# ===========================================================================
+# Output
+# ===========================================================================
 
-## only validate on species that occur in training data for this model
-val <- val |>
-  filter(species %in% species_names)
+#| output
+checkpoint_dir_out <- checkpoint_dir
 
-val_reshape <- val |>
-  left_join(species_inds) |>
-  group_by(species) |>
-  summarise(env = list(as.matrix(pick(c(-X, -Y, -starts_with("na_ind_"), -index)))),
-            na_mask = list(as.matrix(pick(c(starts_with("na_ind_"), -na_ind_X, -na_ind_Y)))),
-            spec = list(as.matrix(pick(c(index)))))
+# ===========================================================================
+# Data Loading
+# ===========================================================================
 
-na_mask_val <- map(val_reshape$na_mask, ~ 1 - .x)
-env_val <- map2(val_reshape$env, na_mask_val,
-                ~ {.x[.y == 0] <- 0; .x})
-species_val <- val_reshape$spec
+message("Loading training data from: ", encoded_train_parquet)
+t_load <- Sys.time()
 
-# species_val <- val |>
-#   left_join(species_inds) |>
-#   pull(index)
+train_data <- arrow::read_parquet(encoded_train_parquet)
+latent_cols <- grep("^latent_", names(train_data), value = TRUE)
+coord_dim <- length(latent_cols)
+message("Latent columns: ", paste(latent_cols, collapse = ", "))
+message("Coord dim (active latent dims): ", coord_dim)
 
-env_train <- train |>
-  select(-species, -X, -Y, -starts_with("na_ind_")) |>
-  as.matrix()
-na_mask_train <- train |>
-  select(starts_with("na_ind_"), -na_ind_X, -na_ind_Y) |>
-  as.matrix()
-  
-na_mask_train <- 1 - na_mask_train
-env_train[na_mask_train == 0] <- 0
+# Load species map
+species_map <- readRDS(species_map_file)
+n_species <- length(species_map)
+message("Species map: ", n_species, " species")
 
-env_dataset <- dataset(name = "env_ds",
-                       initialize = function(env, mask, spec) {
-                         self$env <- torch_tensor(env)
-                         self$mask <- torch_tensor(mask)
-                         self$spec <- torch_tensor(spec)
-                       },
-                       .getbatch = function(i) {
-                         list(env = self$env[i, ], mask = self$mask[i,], spec = self$spec[i])
-                       },
-                       .length = function() {
-                         self$env$size()[[1]]
-                       })
+# Convert to tensors
+train_latent <- torch_tensor(
+  as.matrix(train_data[, latent_cols]),
+  dtype = torch_float32()
+)
+train_species_ids <- torch_tensor(
+  as.integer(species_map[train_data$species]),
+  dtype = torch_long()
+)
+n_train <- train_latent$shape[1]
+message("Training samples: ", format(n_train, big.mark = ","))
 
-env_val_dataset <- dataset(name = "env_ds",
-                           initialize = function(env, mask, spec) {
-                             self$env <- map(env, torch_tensor)
-                             self$mask <- map(mask, torch_tensor)
-                             self$spec <- map(spec, ~ torch_tensor(.x[ , 1]))
-                           },
-                           .getbatch = function(i) {
-                             list(env = self$env[i], mask = self$mask[i], spec = self$spec[i])
-                           },
-                           .length = function() {
-                             length(self$env)
-                           })
+# Validation data
+message("Loading validation data from: ", encoded_val_parquet)
+val_data <- arrow::read_parquet(encoded_val_parquet)
+val_latent <- torch_tensor(
+  as.matrix(val_data[, latent_cols]),
+  dtype = torch_float32()
+)
+# Map val species; unknown species get NA -> filter them out
+val_species_raw <- species_map[val_data$species]
+val_known_mask <- !is.na(val_species_raw)
+n_unknown <- sum(!val_known_mask)
+if (n_unknown > 0) {
+  message("Filtering ", n_unknown, " validation samples with unknown species")
+  val_latent <- val_latent[val_known_mask, ]
+  val_species_raw <- val_species_raw[val_known_mask]
+}
+val_species_ids <- torch_tensor(
+  as.integer(val_species_raw),
+  dtype = torch_long()
+)
+message("Validation samples: ", format(val_latent$shape[1], big.mark = ","),
+        " (", length(unique(as.integer(val_species_raw))), " known species)")
 
-batch_size <- 1000000 / 50
-batch_size_val <- 50
+# Select fixed validation species (most samples in val set, tracked across epochs)
+val_species_counts <- table(as.integer(val_species_raw))
+top_species <- as.integer(names(sort(val_species_counts, decreasing = TRUE)))
+n_fix <- min(n_fixed_val_species, length(top_species))
+fixed_val_species <- top_species[seq_len(n_fix)]
+fixed_names <- names(species_map)[match(fixed_val_species, species_map)]
+message("Fixed validation species (", n_fix, "): ",
+        paste(fixed_names, collapse = ", "))
 
-train_ds <- env_dataset(env_train, na_mask_train, species_train)
-train_dl <- dataloader(train_ds, batch_size, shuffle = TRUE)
-n_batch <- length(train_dl)
+rm(train_data, val_data, val_species_raw, val_species_counts, top_species)
+gc(verbose = FALSE)
 
-val_ds <- env_val_dataset(env_val, na_mask_val, species_val)
-val_dl <- dataloader(val_ds, batch_size_val, shuffle = TRUE)
+load_time <- round(as.numeric(Sys.time() - t_load, units = "secs"))
+message("Data load time: ", load_time, "s")
 
-input_dim <- ncol(env_train)
-n_spec <- n_distinct(species_train)
-spec_embed_dim <- 256L
-latent_dim <- 16L
-breadth <- 1024L
-alpha <- 0
-K <- 50
-lambda <- 1
+# ===========================================================================
+# Batch Index Vectors (memory-efficient, from GeODE pattern)
+# ===========================================================================
 
-nchencdr <- nichencoder(input_dim, n_spec, spec_embed_dim, latent_dim, breadth, loggamma_init = -3)
-nchencdr$cuda()
+message("Shuffling and creating batch index vectors...")
+shuffled_idx <- sample.int(n_train)
+n_batches <- ceiling(n_train / batch_size)
 
-# env_vae <- env_vae_mod(input_dim, n_spec, spec_embed_dim, latent_dim, breadth, loggamma_init = -3)
-# env_vae <- env_vae$cuda()
+batch_indices <- vector("list", n_batches)
+for (b in seq_len(n_batches)) {
+  b_start <- (b - 1) * batch_size + 1
+  b_end <- min(b * batch_size, n_train)
+  batch_indices[[b]] <- shuffled_idx[b_start:b_end]
+}
+rm(shuffled_idx)
+gc(verbose = FALSE)
+message("Created ", n_batches, " batch index vectors of ~",
+        format(batch_size, big.mark = ","), " samples")
 
-num_epochs <- 1000
+# ===========================================================================
+# Model Init / Checkpoint Resume
+# ===========================================================================
 
-lr <- 0.002
-optimizer <- optim_adamw(nchencdr$parameters, lr = lr)
-scheduler <- lr_one_cycle(optimizer, max_lr = lr,
-                          epochs = num_epochs, steps_per_epoch = length(train_dl),
-                          cycle_momentum = FALSE)
+dir.create(checkpoint_dir, recursive = TRUE, showWarnings = FALSE)
 
-epoch_times <- numeric(num_epochs * length(train_dl))
-i <- 0
-#b <- train_dl$.iter()$.next()
+# Clear checkpoints if requested (fresh start with new architecture)
+if (clear_checkpoints && dir.exists(checkpoint_dir)) {
+  message("Clearing checkpoint directory: ", checkpoint_dir)
+  unlink(list.files(checkpoint_dir, full.names = TRUE))
+}
 
-# zz <- file("output/logs/squamate_env_model_fixed2_run_1.txt", open = "wt")
-# sink(zz, type = "output", split = TRUE)
-# sink(zz, type = "message")
-mse <- torch_tensor(-99)
+# Two copies: model (for checkpointing/ODE) and model_jit (for training)
+checkpoint <- find_latest_checkpoint(checkpoint_dir)
+start_epoch <- 0L
 
-for (epoch in 1:num_epochs) {
-  
-  epoch_time <- Sys.time()
-  batchnum <- 0
-  coro::loop(for (b in train_dl) {
-    
-    batchnum <- batchnum + 1
-    i <- i + 1
+message("Initializing NichEncoderTrajNet: coord_dim=", coord_dim,
+        ", n_species=", n_species, ", spec_embed_dim=", spec_embed_dim)
+model <- nichencoder_traj_net(
+  coord_dim = coord_dim, n_species = n_species,
+  spec_embed_dim = spec_embed_dim, breadths = breadths,
+  model_device = device, loss_type = loss_type
+)
+model_jit <- nichencoder_traj_net(
+  coord_dim = coord_dim, n_species = n_species,
+  spec_embed_dim = spec_embed_dim, breadths = breadths,
+  model_device = device, loss_type = loss_type
+)
+model <- model$to(device = device)
+model_jit <- model_jit$to(device = device)
+
+if (!is.null(checkpoint)) {
+  message("Loading weights from checkpoint: ", checkpoint$path,
+          " (epoch ", checkpoint$epoch, ")")
+  load_model_checkpoint(model, checkpoint$path)
+  model_jit$load_state_dict(model$state_dict())
+  start_epoch <- checkpoint$epoch
+}
+
+# JIT trace components for training speed
+# species_embedding stays outside JIT (integer input), encode_spec gets
+# the embedded float tensor
+message("JIT tracing model components...")
+trace_idx <- batch_indices[[1]][seq_len(min(1000L, length(batch_indices[[1]])))]
+test_batch <- generate_nichencoder_training_data(
+  train_latent[trace_idx, ], train_species_ids[trace_idx],
+  device = device, noise_scale = latent_noise_scale,
+  time_sampling = time_sampling,
+  time_logit_normal_mean = time_logit_normal_mean,
+  time_logit_normal_sd = time_logit_normal_sd
+)
+
+# Embed species for JIT trace inputs
+test_spec_emb <- model_jit$species_embedding(test_batch$spec_ids)
+test_spec_enc <- model_jit$encode_spec(test_spec_emb)
+
+model_jit$encode_t <- jit_trace(model_jit$encode_t, test_batch$t)
+model_jit$encode_spec <- jit_trace(model_jit$encode_spec, test_spec_emb)
+model_jit$unet <- jit_trace(
+  model_jit$unet, test_batch$coords,
+  model_jit$encode_t(test_batch$t),
+  test_spec_enc
+)
+message("JIT tracing complete")
+
+rm(test_batch, test_spec_emb, test_spec_enc)
+gc(verbose = FALSE)
+
+# ===========================================================================
+# Optimizer & Scheduler (Two-Cycle LR with Optimizer Reset)
+# ===========================================================================
+
+remaining_epochs <- num_epochs - start_epoch
+
+# Compute cycle boundaries
+cycle_1_end <- as.integer(num_epochs * cycle_1_fraction)
+
+# Determine which cycle we are in (for checkpoint resume)
+if (start_epoch < cycle_1_end) {
+  current_cycle <- 1L
+} else {
+  current_cycle <- 2L
+}
+
+if (current_cycle == 1L) {
+  cycle_1_remaining <- cycle_1_end - start_epoch
+  optimizer <- optim_adamw(model_jit$parameters, lr = lr, weight_decay = 0.01)
+  scheduler <- lr_one_cycle(
+    optimizer, max_lr = lr,
+    epochs = cycle_1_remaining,
+    steps_per_epoch = n_batches,
+    cycle_momentum = FALSE
+  )
+  message("Cycle 1: epochs ", start_epoch + 1, "-", cycle_1_end,
+          " | lr=", lr, " | ", cycle_1_remaining, " epochs remaining")
+} else {
+  cycle_2_remaining <- num_epochs - start_epoch
+  cycle_2_lr <- lr * cycle_2_lr_factor
+  optimizer <- optim_adamw(model_jit$parameters, lr = cycle_2_lr, weight_decay = 0.01)
+  scheduler <- lr_one_cycle(
+    optimizer, max_lr = cycle_2_lr,
+    epochs = cycle_2_remaining,
+    steps_per_epoch = n_batches,
+    cycle_momentum = FALSE
+  )
+  message("Cycle 2 (resumed): epochs ", start_epoch + 1, "-", num_epochs,
+          " | lr=", cycle_2_lr, " | ", cycle_2_remaining, " epochs remaining")
+}
+
+message("Batches per epoch: ", n_batches,
+        " | Remaining epochs: ", remaining_epochs,
+        " | Cycle boundary: epoch ", cycle_1_end)
+
+# ===========================================================================
+# Training Loop
+# ===========================================================================
+
+message("\n=== Starting training ===")
+message("Device: ", device, " | Epochs: ", start_epoch + 1, "-", num_epochs)
+
+for (epoch in seq(start_epoch + 1, num_epochs)) {
+  epoch_start <- Sys.time()
+  epoch_loss <- 0
+
+  for (b in seq_len(n_batches)) {
     optimizer$zero_grad()
-    
-    c(x, z, s, means, log_vars, iwae_loss, spec_loss) %<-% nchencdr(b$env$cuda(),
-                                                                    b$spec$cuda(),
-                                                                    na_mask = b$mask$cuda(),
-                                                                    K = K)
-    
-    
-    loss <- iwae_loss + spec_loss
-   
-    
-      cat("Step:", i,
-          "\nEpoch:", epoch,
-          "\nbatch:", batchnum, "of ", n_batch,
-          "\nloss:", as.numeric(loss$cpu()),
-          "\nIWAE loss:", as.numeric(iwae_loss$cpu()),
-          "\nSpecies loss:", as.numeric(spec_loss$cpu()),
-          "\nValidation MSE:", as.numeric(mse$cpu()),
-          "\nloggamma:", as.numeric(nchencdr$vae$loggamma$cpu()),
-          "\ncond. active dims:", as.numeric((torch_exp(log_vars)$mean(dim = 1L) < 0.5)$sum()$cpu()),
-          "\nSpecies latent variance:", as.numeric(torch_var(s, dim = 1)$mean()$cpu()),
-          "\n\n")
-      
+
+    idx <- batch_indices[[b]]
+    batch <- generate_nichencoder_training_data(
+      train_latent[idx, ], train_species_ids[idx],
+      device = device, noise_scale = latent_noise_scale,
+      time_sampling = time_sampling,
+      time_logit_normal_mean = time_logit_normal_mean,
+      time_logit_normal_sd = time_logit_normal_sd
+    )
+
+    # Embed species (outside JIT) then encode
+    spec_emb <- model_jit$species_embedding(batch$spec_ids)
+    spec_enc <- model_jit$encode_spec(spec_emb)
+
+    # Forward through JIT-traced model
+    output <- model_jit(batch$coords, batch$t, spec_enc)
+    loss <- model_jit$loss_function(output, batch$target)
+
     loss$backward()
     optimizer$step()
     scheduler$step()
-  })
-  
-  ## do validation here
-  gc()
-  cuda_empty_cache()
-  
-  v <- coro::collect(val_dl, 1)[[1]]
-  if(coro::is_exhausted(v)) {
-    val_dl <- dataloader(val_ds, batch_size, shuffle = TRUE)
-    v <- coro::collect(val_dl, 1)[[1]]
+
+    batch_loss <- as.numeric(loss$cpu())
+    epoch_loss <- epoch_loss + batch_loss
+
+    if (b %% 10 == 0 || b == n_batches) {
+      message("  Epoch ", epoch, " batch ", b, "/", n_batches,
+              " | loss: ", round(batch_loss, 6))
+    }
   }
-  
-  with_no_grad({
-    x <- torch_cat(v$env)$cuda()
-    recon <- nchencdr$reconstruct_from_species_index(x, 
-                                                     torch_cat(v$spec)$cuda(),
-                                                     K = 1)
-    
-    mse <- torch_mean(torch_square(x - recon))
-  })
-  
-  prob_species <- function(env_spec, spec) {
-    with_no_grad({
-      dim_choose <- sample.int(30, 2)
-      env_dat <- as.matrix(env_spec)[ , dim_choose]
-      range_1 <- range(env_dat[ , 1])
-      range_2 <- range(env_dat[ , 2])
-      range_1 <- range_1 + c(-0.3*diff(range_1), 0.3*diff(range_1))
-      range_2 <- range_2 + c(-0.3*diff(range_2), 0.3*diff(range_2))
-      test_grid <- expand_grid(var_1 = seq(range_1[1], range_1[2], length.out = 100),
-                               var_2 = seq(range_2[1], range_2[2], length.out = 100)) |>
-        as.matrix() |>
-        torch_tensor(device = "cuda")
-      x_means <- torch_mean(torch_tensor(env_spec, device = "cuda"), dim = 1, keepdim = TRUE)$expand(c(nrow(test_grid), -1))$clone()
-      x_means[ , dim_choose] <- test_grid
-      
-      spec_expanded <- spec[1]$expand(c(x_means$shape[1]))
-      iwae_losses <- nchencdr$iwae_loss_from_species_index(x_means,
-                                                           spec_expanded$cuda(),
-                                                           torch_ones_like(x_means),
-                                                           K = 100)
-      
-      plot_df <- as.matrix(test_grid$cpu()) |>
-        as.data.frame() |>
-        mutate(prob = as.numeric(iwae_losses$cpu()))
+
+  mean_epoch_loss <- epoch_loss / n_batches
+  epoch_time <- round(as.numeric(Sys.time() - epoch_start, units = "secs"), 1)
+
+  # Print train data (captured by #| data)
+  cat("train_epoch:", epoch, "\n")
+  cat("train_loss:", round(mean_epoch_loss, 8), "\n")
+
+  message("Epoch ", epoch, " complete in ", epoch_time, "s",
+          " | mean loss: ", round(mean_epoch_loss, 6))
+
+  # Cycle transition: reset optimizer at cycle boundary
+  if (n_cycles >= 2L && epoch == cycle_1_end) {
+    message("\n=== Cycle 1 complete, resetting optimizer for Cycle 2 ===")
+    cycle_2_lr <- lr * cycle_2_lr_factor
+    cycle_2_epochs <- num_epochs - cycle_1_end
+    message("Cycle 2: epochs ", cycle_1_end + 1, "-", num_epochs,
+            " | lr=", cycle_2_lr, " | ", cycle_2_epochs, " epochs")
+    optimizer <- optim_adamw(model_jit$parameters, lr = cycle_2_lr, weight_decay = 0.01)
+    scheduler <- lr_one_cycle(
+      optimizer, max_lr = cycle_2_lr,
+      epochs = cycle_2_epochs,
+      steps_per_epoch = n_batches,
+      cycle_momentum = FALSE
+    )
+  }
+
+  # Checkpoint
+  if (epoch %% checkpoint_every == 0 || epoch == num_epochs) {
+    message("  Saving checkpoint...")
+    model$load_state_dict(model_jit$state_dict())
+    save_model_checkpoint(model, checkpoint_dir, epoch)
+  }
+
+  # Validation
+  if (epoch %% val_every == 0 || epoch == num_epochs) {
+    message("  Running validation...")
+    model$load_state_dict(model_jit$state_dict())
+    tryCatch({
+      val_result <- validate_nichencoder(
+        model, val_latent, val_species_ids, species_map,
+        fixed_species_ids = fixed_val_species,
+        n_random_plot_species = n_random_val_species,
+        n_metric_species = n_metric_species,
+        device = device, ode_steps = ode_steps,
+        checkpoint_dir = checkpoint_dir, epoch = epoch
+      )
+      cat("val_epoch:", epoch, "\n")
+      cat("val_loss:", round(val_result$val_loss, 8), "\n")
+      cat("val_swd:", round(val_result$val_swd, 8), "\n")
+      cat("val_centroid_mse:", round(val_result$val_centroid_mse, 8), "\n")
+    }, error = \(e) {
+      message("  Validation error: ", e$message)
     })
-    
-    p <- ggplot(plot_df, aes(V1, V2)) +
-      geom_raster(aes(fill = prob)) +
-      geom_point(data = as.data.frame(env_dat) |> setNames(c("V1", "V2")),
-                 alpha = 0.25) +
-      scale_fill_viridis_c() +
-      theme_minimal()
-    gc()
-    cuda_empty_cache()
-    p
+    gc(); cuda_empty_cache()
   }
-  
-  spec_plots <- map2(v$env[1:9], v$spec[1:9],
-                     prob_species, .progress = TRUE)
-  
-  ps <- wrap_plots(spec_plots, ncol = 3, nrow = 3)
-  ggsave("prob_progress_temp.png", ps, width = 16, height = 16)
-  plot(ps)
-  
-  time <- Sys.time() - epoch_time
-  epoch_times[i] <- time
-  cat("Estimated time remaining: ")
-  print(lubridate::as.duration(mean(epoch_times[epoch_times > 0]) * (num_epochs - epoch)))
-  cat("\n")
-  
+
+  gc(); cuda_empty_cache()
 }
 
-#options(torch.serialization_version = 2)
-torch_save(env_vae, "output/testing/env_vae_trained_test_256d_iwae.to")
-
-#sink()
-
-##### testing validation
-env_vae <- torch_load("output/testing/env_vae_trained_test_256d_iwae.to")
-#env_vae$load_state_dict(env_vae2$state_dict())
-env_vae <- env_vae$cuda()
-
-
-
-
-
-x_recon <- env_vae$decode(z, spec_lat)
+message("\n=== Training complete ===")
+message("Final checkpoint directory: ", checkpoint_dir)
