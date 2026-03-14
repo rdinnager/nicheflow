@@ -93,7 +93,7 @@ build_species_metadata <- function(jade_samples, species_map) {
 #' @return Matrix [n_background, 2] of (lon, lat) background coordinates
 generate_background_points <- function(presence_xy,
                                        n_background,
-                                       radius_multiplier = 0.5,
+                                       radius_multiplier = 0.25,
                                        oversample_factor = 5L) {
   n_pres <- nrow(presence_xy)
 
