@@ -992,7 +992,7 @@ tar_plan(
     eval_selected_species,
     {
       meta <- eval_species_metadata |>
-        filter(n_points >= 70,        # rough min for 50 train + 20 test
+        filter(n_points >= 2,          # must have some data
                shot_type != "zeroshot") # no embeddings for zeroshot species
 
       # Create strata: taxon × shot_type × latitude_band × range_size

@@ -615,7 +615,7 @@ prepare_eval_batch <- function(species_batch, jade_train_data,
     sp_train <- jade_train_data |> filter(species == sp)
     sp_test <- jade_test_data |> filter(species == sp)
 
-    if (nrow(sp_train) < 50 || nrow(sp_test) < 20) next
+    if (nrow(sp_train) == 0 || nrow(sp_test) == 0) next
 
     # All presence XY for background generation
     all_pres_xy <- rbind(
@@ -1075,7 +1075,7 @@ evaluate_emd_batch <- function(species_batch, jade_test_data, jade_train_data,
 
     sp_test <- jade_test_data |> filter(species == sp)
     sp_train <- jade_train_data |> filter(species == sp)
-    if (nrow(sp_test) < 20) next
+    if (nrow(sp_test) == 0) next
 
     truth_xy <- cbind(sp_test$X, sp_test$Y)
 
