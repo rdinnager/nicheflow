@@ -4,8 +4,8 @@
 #SBATCH --gres=gpu:l4:2
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=18
-#SBATCH --mem=96G
+#SBATCH --cpus-per-task=14
+#SBATCH --mem=192G
 #SBATCH --time=3-00:00:00
 #SBATCH --output logs/job-%x-%j.out
 #SBATCH --error logs/job-%x-%j.err
@@ -38,17 +38,25 @@ pwd
 nvidia-smi
 echo "==========================="
 
-# Run all evaluation + disdat targets
+# Run evaluation targets first (independent of disdat)
 # nichencoder_training is protected with cue="never" so it won't re-run
-# even though it shows as outdated from depend-hash drift.
 Rscript -e '
   targets::tar_make(
     names = c(
       eval_swd_parquet,
       eval_auc_parquet,
-      eval_emd_parquet,
-      disdat_parquets
+      eval_emd_parquet
     )
+  )
+'
+
+echo "=== Eval targets done, now disdat ==="
+date
+
+# Run disdat separately so its errors don't kill the eval pipeline
+Rscript -e '
+  targets::tar_make(
+    names = disdat_parquets
   )
 '
 

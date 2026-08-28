@@ -17,10 +17,9 @@
 #' @param chelsa_var_meta Variable metadata tibble
 #' @param env_mean_sd Standardization stats (mean, sd vectors)
 #' @param chelsa_bio_dir Path to CHELSA bio raster directory
-#' @param bioclim_pattern Regex for filtering bioclim files
 #' @return List with train_data, bg_data, test_data, region
 prepare_disdat_region <- function(region, chelsa_var_meta, env_mean_sd,
-                                  chelsa_bio_dir, bioclim_pattern) {
+                                  chelsa_bio_dir) {
   message("Preparing disdat region: ", region)
 
   # Load disdat data
@@ -28,10 +27,8 @@ prepare_disdat_region <- function(region, chelsa_var_meta, env_mean_sd,
   bg <- disdat::disBg(region)  # background points
   pa <- disdat::disPa(region)  # presence-absence test data
 
-  # Load CHELSA raster stack
-  rast_files <- list.files(chelsa_bio_dir, full.names = TRUE) |>
-    stringr::str_subset(bioclim_pattern)
-  rast_stack <- terra::rast(rast_files)
+  # Load CHELSA raster stack (all 31 vars in correct order)
+  rast_stack <- build_chelsa_rast_stack(chelsa_var_meta, chelsa_bio_dir)
 
   # -- Training presences --
   po_xy <- cbind(po$x, po$y)

@@ -1,0 +1,2 @@
+squeue -j 27204762 --format="%S"
+squeue -u rdinnage.fiu --format="%.10i %.20j %.8T %.10M %.4C %.20R %.20S"
